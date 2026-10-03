@@ -1,16 +1,23 @@
 /**
  * Telemetry for the guard contract's events.
  *
- * The listener consumes **two** streams, and this is the part that is easy to
- * get wrong: a blocked decision never reaches the ledger. The guard returns
- * `Err`, which rolls the event back, so a listener that only tails committed
- * ledger events sees a contract that appears to approve everything. The two
- * streams are:
+ * The listener consumes **two** streams (plus an opt-in third, added in #58),
+ * and this is the part that is easy to get wrong: a blocked decision never
+ * reaches the ledger. The guard returns `Err`, which rolls the event back, so
+ * a listener that only tails committed ledger events sees a contract that
+ * appears to approve everything. The streams are:
  *
  *   1. **ledger events** — `server.getEvents`, filtered to the guard contract.
  *      Carries allowed decisions, heartbeats, and the admin lifecycle events.
  *   2. **simulation diagnostics** — attached to a failed *enforced simulation*.
  *      Carries blocked decisions, which by construction have no transaction.
+ *   3. **failed-transaction diagnostics** (opt-in, `failedTx` option) —
+ *      attached to a transaction that *was* broadcast, included in a ledger,
+ *      and then failed on-chain. Its events roll back exactly like a blocked
+ *      simulation's, but the RPC preserves them on the `getTransaction` /
+ *      `getTransactions` response (`diagnosticEventsXdr`, public and typed in
+ *      the pinned stellar-sdk 17.0.1 — see docs/event-schema.md for the spike
+ *      evidence).
  *
  * The topic vocabulary is the one verified against the live chain in
  * `docs/event-schema.md`, not the one the contracts documentation describes.
@@ -25,7 +32,7 @@
  * `docs/event-schema.md` and implemented by `guardEventId` below.
  */
 import { createHash } from "node:crypto";
-import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
+import { rpc, scValToNative, StrKey, xdr } from "@stellar/stellar-sdk";
 import { GUARD_AUTH_RESULTS, GUARD_EVENT_TOPICS, decodeAuthDecision, normalizeEventData, type GuardAuthDecision } from "./events.ts";
 import { topicSymbols } from "./invoke.ts";
 
@@ -64,7 +71,7 @@ export type GuardEventSource = "ledger" | "diagnostic";
  * tell a committed event from a pre-broadcast one without knowing the SDK's
  * two-channel model.
  */
-export type GuardEventStream = "committed" | "diagnostic";
+export type GuardEventStream = "committed" | "diagnostic" | "failed_tx";
 
 export interface GuardEvent {
   /**
@@ -225,7 +232,7 @@ function stableStringify(value: unknown, depth = 0): string {
  */
 export type GuardEventContext = Omit<
   GuardEvent,
-  "kind" | "topic" | "id" | "decision" | "data" | "stream" | "observedAt"
+  "kind" | "topic" | "id" | "decision" | "data" | "observedAt"
 > & {
   /** Position within the diagnostic batch; null on the ledger stream. */
   simulationIndex: number | null;
@@ -258,7 +265,7 @@ function interpret(
       simulationIndex,
     }),
     ...streamFacts,
-    stream: streamFacts.source === "ledger" ? "committed" : "diagnostic",
+    stream: streamFacts.stream,
     observedAt: observedAt ?? null,
     decision: decodeAuthDecision(topics, context.source),
     data: normalizeEventData(data),
@@ -282,6 +289,7 @@ export function diagnosticsToEvents(
     if (topics.length === 0) continue;
     const decoded = interpret(topics, decodeData(dataOf(bare)), {
       source: "diagnostic",
+      stream: "diagnostic",
       contractId: guard ?? null,
       ledger: null,
       ledgerClosedAt: null,
@@ -312,6 +320,60 @@ export function guardEventsFromDiagnostics(
   return diagnosticsToEvents(diagnosticEvents, guard);
 }
 
+/**
+ * Decode the guard events carried by a failed on-chain transaction.
+ *
+ * A transaction can pass enforced pre-flight and still fail after inclusion
+ * (stale resource pricing, a race the simulation could not see). Its Soroban
+ * auth events roll back exactly like a blocked simulation's — but unlike the
+ * simulation path, the RPC preserves the diagnostics: `getTransaction` and
+ * `getTransactions` attach `diagnosticEventsXdr` to a FAILED response. That is
+ * a public, typed field of the pinned stellar-sdk 17.0.1
+ * (`Api.GetFailedTransactionResponse` — spike evidence in
+ * `docs/event-schema.md`); nothing here reaches into SDK internals.
+ *
+ * The `auth_checked` decoding is deliberately the *same* one the simulation
+ * path uses (this delegates to the canonical `interpret` engine): the contract
+ * emits the identical event schema in both contexts. Only the markers differ —
+ * the event keeps `source: "diagnostic"` (it rolled back; it is not a
+ * committed contract event) and gains `stream: "failed_tx"` plus the failed
+ * transaction's hash and ledger. `ledgerClosedAt` stays null: the RPC returns
+ * `createdAt` as unix seconds here, not the ISO close time this field carries
+ * elsewhere, and re-formatting it is this module's business only once there is
+ * a consumer that needs it.
+ *
+ * Accepts the structural subset of either response type (`GetFailedTransactionResponse`
+ * from `getTransaction`, `TransactionInfo` from `getTransactions`), so the
+ * listener and direct callers share one decoder.
+ */
+export function guardEventsFromFailedTransaction(
+  tx: Pick<
+    rpc.Api.GetFailedTransactionResponse,
+    "txHash" | "ledger" | "createdAt" | "diagnosticEventsXdr"
+  >,
+  guard?: string,
+): GuardEvent[] {
+  const out: GuardEvent[] = [];
+  for (const [index, raw] of (tx.diagnosticEventsXdr ?? []).entries()) {
+    const bare = (raw as { event?: unknown }).event ?? raw;
+    const topics = topicSymbols(bare);
+    if (topics.length === 0) continue;
+    const decoded = interpret(topics, decodeData(dataOf(bare)), {
+      source: "diagnostic",
+      stream: "failed_tx",
+      contractId: guard ?? null,
+      ledger: tx.ledger,
+      ledgerClosedAt: null,
+      transactionHash: tx.txHash,
+      // Position within this transaction's diagnostic batch, so two identical
+      // events in one failed transaction cannot share a content-derived id.
+      simulationIndex: index,
+    });
+    if (decoded) out.push(decoded);
+  }
+  return out;
+}
+
 function dataOf(raw: unknown): unknown {
   const candidate = raw as {
     body?: unknown;
@@ -321,6 +383,18 @@ function dataOf(raw: unknown): unknown {
     | { v0?: { data?: unknown }; value?: { v0?: { data?: unknown } } }
     | undefined;
   return body?.v0?.data ?? body?.value?.v0?.data;
+}
+
+/** True only when the diagnostic's emitting contract is this guard. */
+function emittedByGuard(raw: unknown, guard: string): boolean {
+  const bare = (raw as { event?: unknown }).event ?? raw;
+  const contractId = (bare as { contractId?: xdr.ContractId | null }).contractId;
+  if (!contractId) return false;
+  try {
+    return StrKey.encodeContract(contractId.toBytes()) === guard;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -433,6 +507,8 @@ export interface GuardTelemetryConfig {
   server: rpc.Server;
   /** The guard contract to follow. */
   guard: string;
+  /** Opt in to scanning failed transaction diagnostics as a third stream. */
+  failedTx?: boolean;
   /** RPC URL, only used for error messages. */
   rpcUrl?: string;
   /**
@@ -485,6 +561,26 @@ export interface GuardTelemetryGap {
   /** `latestLedger` of that same response. */
   retainedToLedger: number;
 }
+
+/**
+ * One page of the failed-transaction scan. Shape-matched to `PollResult` but
+ * without `latestLedger`: the scan's only cursor obligation is to round-trip
+ * the value the caller handed back, and the two streams' cursors are never
+ * exchanged (see `pollFailedTransactions`).
+ */
+export interface FailedTxPollResult {
+  events: GuardEvent[];
+  /** Cursor to resume the failed-transaction scan from. */
+  cursor: string;
+}
+
+/**
+ * Cap on failed-transaction hashes tracked for per-process dedup, trimmed
+ * oldest-first past the cap (`docs/event-schema.md`, "Deduplication"). A page
+ * only ever re-reads one page back after an error, so the cap just has to
+ * cover what a retention window can still resurface.
+ */
+const MAX_TRACKED_FAILED_TX = 1_000;
 
 export type TelemetryJitter = "none" | "full";
 
@@ -809,6 +905,19 @@ export class GuardTelemetryListener {
     return this.lastError;
   }
 
+  /**
+   * Failed-transaction hashes already surfaced, so a re-encountered page (the
+   * `getTransactions` cursor is not advanced on a mid-page error) or a retry
+   * never emits the same failed_tx event twice.
+   *
+   * This is process-local checkpoint state, not a substitute for the cursors:
+   * across a listener restart the streams resume from their cursors and this
+   * set starts empty, so a failed transaction still inside the retention
+   * window may be re-surfaced once — the same at-least-once behavior the
+   * committed stream has when no cursor was persisted.
+   */
+  private readonly processedFailedTx = new Set<string>();
+
   constructor(config: GuardTelemetryConfig) {
     this.config = config;
     this.buffer = config.buffer ? new GuardEventRingBuffer(config.buffer.max) : null;
@@ -833,6 +942,93 @@ export class GuardTelemetryListener {
   private record(events: readonly GuardEvent[]): void {
     if (!this.buffer) return;
     for (const event of events) this.buffer.push(event);
+  }
+
+  /** Record a hash as processed, trimming the oldest entry past the cap. */
+  private rememberFailedTx(hash: string): void {
+    this.processedFailedTx.add(hash);
+    if (this.processedFailedTx.size > MAX_TRACKED_FAILED_TX) {
+      const oldest = this.processedFailedTx.values().next().value;
+      if (oldest !== undefined) this.processedFailedTx.delete(oldest);
+    }
+  }
+
+  /**
+   * Decode one failed transaction's diagnostics into GuardEvents.
+   *
+   * Diagnostics attributed to the guard contract go through the canonical
+   * `interpret` engine — the same topic filter and decision decoder every
+   * other stream uses — so an unknown topic (host noise, another contract's
+   * event) is dropped, never guessed at, and a malformed event that throws
+   * while decoding is skipped rather than crashing the poll.
+   */
+  private decodeFailedTransaction(tx: rpc.Api.TransactionInfo): GuardEvent[] {
+    const out: GuardEvent[] = [];
+    for (const [index, raw] of (tx.diagnosticEventsXdr ?? []).entries()) {
+      try {
+        const bare = (raw as { event?: unknown }).event ?? raw;
+        const topics = topicSymbols(bare);
+        if (topics.length === 0) continue;
+        if (!emittedByGuard(raw, this.config.guard)) continue;
+        const decoded = interpret(topics, decodeData(dataOf(bare)), {
+          source: "diagnostic",
+          stream: "failed_tx",
+          contractId: this.config.guard,
+          ledger: tx.ledger,
+          ledgerClosedAt: null,
+          transactionHash: tx.txHash,
+          // Position within this transaction's diagnostic batch, so two identical
+          // events in one failed transaction cannot share a content-derived id.
+          simulationIndex: index,
+        });
+        if (decoded) out.push(decoded);
+      } catch {
+        // A single malformed diagnostic must not take down the poll; the
+        // transaction's other events, and the page, continue.
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Read one page of failed transactions independently from the event cursor.
+   * Without a cursor, start at the current head so existing failures are not
+   * replayed retroactively.
+   */
+  async pollFailedTransactions(
+    params: { cursor?: string; startLedger?: number; limit?: number } = {},
+  ): Promise<FailedTxPollResult> {
+    if (params.cursor === undefined && params.startLedger === undefined) {
+      const latest = await this.config.server.getLatestLedger();
+      return { events: [], cursor: String(latest.sequence) };
+    }
+
+    const request: rpc.Api.GetTransactionsRequest = params.cursor !== undefined
+      ? {
+          pagination: {
+            cursor: params.cursor,
+            ...(params.limit !== undefined ? { limit: params.limit } : {}),
+          },
+        }
+      : {
+          startLedger: params.startLedger!,
+          ...(params.limit !== undefined ? { pagination: { limit: params.limit } } : {}),
+        };
+
+    try {
+      const response = await this.config.server.getTransactions(request);
+      const events: GuardEvent[] = [];
+      for (const tx of response.transactions) {
+        if (tx.status !== rpc.Api.GetTransactionStatus.FAILED) continue;
+        if (this.processedFailedTx.has(tx.txHash)) continue;
+        this.rememberFailedTx(tx.txHash);
+        events.push(...this.decodeFailedTransaction(tx));
+      }
+      this.record(events);
+      return { events, cursor: response.cursor };
+    } catch {
+      return { events: [], cursor: params.cursor ?? String(params.startLedger) };
+    }
   }
 
   /**
@@ -869,6 +1065,7 @@ export class GuardTelemetryListener {
         decodeData(event.value),
         {
           source: "ledger",
+          stream: "committed",
           contractId,
           ledger: event.ledger,
           ledgerClosedAt: event.ledgerClosedAt ?? null,
@@ -922,6 +1119,7 @@ export class GuardTelemetryListener {
     const sleep: PollSleep = params.sleep ?? defaultPollSleep;
     let cursor = params.cursor;
     let startLedger = params.startLedger;
+    let failedTxCursor: string | undefined;
     this.lastError = null;
 
     // An abort that landed before the iterator was first pulled must not probe
@@ -998,6 +1196,20 @@ export class GuardTelemetryListener {
       // rejects a request that mixes the two modes.
       startLedger = undefined;
 
+      let failedTxEvents: GuardEvent[] = [];
+      if (this.config.failedTx) {
+        try {
+          const failedTxPage = await this.pollFailedTransactions({
+            ...(failedTxCursor !== undefined ? { cursor: failedTxCursor } : {}),
+            ...(params.limit !== undefined ? { limit: params.limit } : {}),
+          });
+          failedTxCursor = failedTxPage.cursor;
+          failedTxEvents = failedTxPage.events;
+        } catch {
+          // This optional stream must not interrupt committed event polling.
+        }
+      }
+
       // ── Gap detection ────────────────────────────────────────────────────
       // The retention window is reported on every response, so the rule is
       // exact rather than heuristic: coverage is broken precisely when the
@@ -1026,7 +1238,8 @@ export class GuardTelemetryListener {
         }
       }
 
-      if (page.events.length > 0) yield page.events;
+      const events = [...page.events, ...failedTxEvents];
+      if (events.length > 0) yield events;
 
       // Advance confirmed coverage. A page that reached the RPC's head confirms
       // everything up to `latestLedger`; a full page (a partial window, more to
@@ -1214,7 +1427,12 @@ export function serializeEvent(event: GuardEvent): string {
 
 /** A compact one-line rendering of a guard event, for logs. */
 export function describeGuardEvent(event: GuardEvent): string {
-  const where = event.source === "ledger" ? `ledger ${event.ledger ?? "?"}` : "pre-broadcast";
+  const where =
+    event.stream === "committed"
+      ? `ledger ${event.ledger ?? "?"}`
+      : event.stream === "failed_tx"
+        ? `failed tx ${event.transactionHash?.slice(0, 8) ?? "?"}`
+        : "pre-broadcast";
   const what =
     event.kind === "auth_checked"
       ? `${event.decision?.result ?? "?"}${event.decision?.reason ? ` (${event.decision.reason})` : ""}`

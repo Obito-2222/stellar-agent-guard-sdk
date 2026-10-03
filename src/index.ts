@@ -212,6 +212,7 @@ export {
   diagnosticsToEvents,
   guardEventId,
   guardEventsFromDiagnostics,
+  guardEventsFromFailedTransaction,
   isAllowedDecision,
   mergeGuardEventStreams,
   serializeEvent,
